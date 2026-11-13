@@ -6,6 +6,7 @@
 > Claude network egress region, and opens Claude Desktop when the check passes.
 
 ![Claude 启动器界面](docs/screenshot.png)
+![Claude 启动器界面](docs/screenshot-2.png)
 
 ## 功能
 
