@@ -1,70 +1,7 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
-
-// MARK: - Pure helpers
-
-struct TraceResult: Equatable {
-    let ip: String
-    let countryCode: String
-
-    var isSupportedRegion: Bool {
-        SupportedRegions.codes.contains(countryCode.uppercased())
-    }
-}
-
-enum SupportedRegions {
-    // Claude Help Center, "Where can I access Claude?", checked 2026-11-11.
-    // https://support.claude.com/en/articles/8461763-where-can-i-access-claude
-    // 177 listed location names map to 176 ISO 3166-1 alpha-2 codes;
-    // "Herzegovina" and "Bosnia and Herzegovina" both map to BA.
-    static let codes: Set<String> = Set("""
-        AD AE AG AL AM AO AR AT AU AZ BA BB BD BE BF BG BH BI BJ BN BO BR BS BT BW BZ
-        CA CG CH CI CL CM CO CR CV CY CZ DE DJ DK DM DO DZ EC EE EG ES FI FJ FM FR
-        GA GB GD GE GH GM GN GQ GR GT GW GY HN HR HT HU ID IE IL IN IQ IS IT JM JO
-        JP KE KG KH KI KM KN KR KW KZ LA LB LC LI LK LR LS LT LU LV MA MC MD ME MG
-        MH MK MN MP MR MT MU MV MW MX MY MZ NA NE NG NL NO NP NR NZ OM PA PE PG PH
-        PK PL PS PT PW PY QA RO RS RW SA SB SC SE SG SI SK SL SM SN SR ST SV SZ TD
-        TG TH TJ TL TM TN TO TR TT TV TW TZ UA UG US UY UZ VA VC VN VU WS ZA ZM ZW
-        """.split(whereSeparator: \.isWhitespace).map(String.init))
-}
-
-enum TraceParser {
-    static func parse(_ text: String) -> TraceResult? {
-        var fields: [String: String] = [:]
-        for rawLine in text.split(whereSeparator: \Character.isNewline) {
-            let line = String(rawLine)
-            guard let separator = line.firstIndex(of: "=") else { continue }
-            let key = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
-            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
-            if !key.isEmpty { fields[key] = value }
-        }
-        guard let ip = fields["ip"], !ip.isEmpty,
-              let countryCode = fields["loc"], !countryCode.isEmpty else {
-            return nil
-        }
-        return TraceResult(ip: ip, countryCode: countryCode.uppercased())
-    }
-}
-
-enum VPNServiceParser {
-    static func serviceNames(from output: String, excluding excludedName: String) -> [String] {
-        var result: [String] = []
-        for line in output.split(whereSeparator: \Character.isNewline) {
-            let text = String(line)
-            guard text.contains("(Connected)") || text.contains("(Connecting)") else { continue }
-            if text.lowercased().contains("tailscale") { continue }
-            guard let firstQuote = text.firstIndex(of: "\"") else { continue }
-            let remainder = text[text.index(after: firstQuote)...]
-            guard let secondQuote = remainder.firstIndex(of: "\"") else { continue }
-            let name = String(remainder[..<secondQuote])
-            if !name.isEmpty && name.caseInsensitiveCompare(excludedName) != .orderedSame {
-                result.append(name)
-            }
-        }
-        return Array(Set(result)).sorted()
-    }
-}
 
 // MARK: - Command execution
 
@@ -73,18 +10,58 @@ struct CommandResult {
     let output: String
 }
 
+private final class PipeBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
 enum Shell {
     static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 20) -> CommandResult {
         let process = Process()
-        let pipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        // A private /dev/null handle. The shared FileHandle.nullDevice can be
+        // closed by Process and then break later launches.
+        if let nullInput = FileHandle(forReadingAtPath: "/dev/null") {
+            process.standardInput = nullInput
+        }
+
+        let output = PipeBuffer()
+        let errors = PipeBuffer()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            output.append(outPipe.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errors.append(errPipe.fileHandleForReading.readDataToEndOfFile())
+            group.leave()
+        }
 
         do {
             try process.run()
         } catch {
+            outPipe.fileHandleForReading.closeFile()
+            errPipe.fileHandleForReading.closeFile()
+            _ = group.wait(timeout: .now() + 1)
             return CommandResult(status: -1, output: error.localizedDescription)
         }
 
@@ -95,14 +72,156 @@ enum Shell {
         if process.isRunning {
             process.terminate()
             Thread.sleep(forTimeInterval: 0.2)
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return CommandResult(status: process.terminationStatus, output: output)
+        process.waitUntilExit()
+        _ = group.wait(timeout: .now() + 2)
+        let text = String(data: output.snapshot() + errors.snapshot(), encoding: .utf8) ?? ""
+        return CommandResult(status: process.terminationStatus, output: text)
     }
 
     static func quote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+// MARK: - Local HTTP over a Unix socket
+
+enum UnixSocketHTTP {
+    struct Result {
+        let status: Int
+        let body: String
+    }
+
+    static func send(
+        socketPath: String,
+        method: String,
+        path: String,
+        body: Data?,
+        bearer: String?,
+        timeout: TimeInterval
+    ) -> Result? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 { return nil }
+        defer { close(fd) }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let copied = socketPath.withCString { source -> Bool in
+            withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+                guard let base = buffer.baseAddress, socketPath.utf8.count < buffer.count else { return false }
+                _ = strlcpy(base.assumingMemoryBound(to: CChar.self), source, buffer.count)
+                return true
+            }
+        }
+        guard copied else { return nil }
+
+        var time = timeval()
+        time.tv_sec = time_t(max(1, Int(timeout)))
+        time.tv_usec = 0
+        let timeSize = socklen_t(MemoryLayout<timeval>.size)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &time, timeSize)
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &time, timeSize)
+        var noSignal: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+
+        let connected = withUnsafePointer(to: &address) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sock in
+                Darwin.connect(fd, sock, socklen_t(MemoryLayout<sockaddr_un>.stride))
+            }
+        }
+        guard connected == 0 else { return nil }
+
+        var header = "\(method) \(path) HTTP/1.0\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n"
+        if let bearer, isSafeToken(bearer) {
+            header += "Authorization: Bearer \(bearer)\r\n"
+        }
+        var payload = Data(header.utf8)
+        if let body {
+            payload.append(Data("Content-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8))
+            payload.append(body)
+        } else {
+            payload.append(Data("\r\n".utf8))
+        }
+        guard writeAll(fd: fd, data: payload) else { return nil }
+
+        var response = Data()
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        while response.count < 262_144 {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 {
+                response.append(buffer, count: count)
+            } else {
+                break
+            }
+        }
+        guard let text = String(data: response, encoding: .utf8),
+              let message = HTTPMessage.split(text) else { return nil }
+        return Result(status: message.status, body: message.body)
+    }
+
+    private static func isSafeToken(_ token: String) -> Bool {
+        !token.isEmpty && !token.contains("\n") && !token.contains("\r") && !token.contains(" ")
+    }
+
+    private static func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return data.isEmpty }
+            var sent = 0
+            while sent < raw.count {
+                let count = Darwin.write(fd, base.advanced(by: sent), raw.count - sent)
+                if count <= 0 { return false }
+                sent += count
+            }
+            return true
+        }
+    }
+}
+
+private func pathExists(_ path: String) -> Bool {
+    path.withCString { pointer in
+        var info = Darwin.stat()
+        return lstat(pointer, &info) == 0
+    }
+}
+
+// MARK: - Log
+
+enum LauncherLog {
+    private static let lock = NSLock()
+    static let displayPath = "~/Library/Logs/ClaudeLauncher/launcher.log"
+
+    static var fileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/ClaudeLauncher/launcher.log")
+    }
+
+    static func write(_ message: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        var line = LogRedactor.redact(message).replacingOccurrences(of: "\n", with: " ")
+        if line.count > 1000 {
+            line = String(line.prefix(1000)) + "…"
+        }
+        let text = "\(stamp) \(line)\n"
+        lock.lock()
+        defer { lock.unlock() }
+        let url = fileURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            if let data = text.data(using: .utf8) {
+                try handle.write(contentsOf: data)
+            }
+        } catch {
+            // A log failure must not stop the launch flow.
+        }
     }
 }
 
@@ -146,7 +265,7 @@ enum IPDetector {
         }
         var traceRequest = URLRequest(url: traceURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
         traceRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        traceRequest.setValue("ClaudeLauncher/1.1", forHTTPHeaderField: "User-Agent")
+        traceRequest.setValue(LauncherVersion.userAgent, forHTTPHeaderField: "User-Agent")
         let (traceData, traceError) = synchronousRequest(traceRequest, timeout: 12)
         if let traceError { return .failure(traceError) }
         guard let traceData,
@@ -158,8 +277,192 @@ enum IPDetector {
         return .success(IPCheckResult(trace: trace, countryName: countryName(for: trace.countryCode)))
     }
 
-    private static func countryName(for code: String) -> String {
+    static func countryName(for code: String) -> String {
         Locale(identifier: "zh_CN").localizedString(forRegionCode: code.uppercased()) ?? code.uppercased()
+    }
+}
+
+// MARK: - Clash Verge service mode
+
+enum ClashController {
+    struct SilenceResult {
+        var notes: [String] = []
+        var ports: Set<Int> = []
+        var sawClash = false
+    }
+
+    private static let vergePorts: Set<Int> = [7890, 7891, 7892, 7893, 7897, 7898, 7899]
+
+    static func silence() -> SilenceResult {
+        var result = SilenceResult()
+        let discovered = configFiles()
+        let secrets = discovered.secrets
+        let sockets = candidateSockets(extra: discovered.sockets)
+        if sockets.isEmpty {
+            LauncherLog.write("clash controller socket not found")
+            return result
+        }
+        for socket in sockets {
+            silence(socket: socket, secrets: secrets, into: &result)
+        }
+        result.notes = uniqueStrings(result.notes)
+        result.ports.formUnion(result.sawClash ? vergePorts : [])
+        return result
+    }
+
+    static func capturePresent() -> Bool {
+        let parts = [
+            Shell.run("/sbin/ifconfig", ["-a"], timeout: 5).output,
+            Shell.run("/usr/sbin/netstat", ["-rn", "-f", "inet"], timeout: 5).output,
+            Shell.run("/usr/sbin/netstat", ["-rn", "-f", "inet6"], timeout: 5).output,
+            Shell.run("/sbin/route", ["-n", "get", "default"], timeout: 5).output
+        ]
+        return NetworkAudit.hasClashCapture(in: parts.joined(separator: "\n"))
+    }
+
+    private static func silence(socket: String, secrets: [String], into result: inout SilenceResult) {
+        guard var probe = UnixSocketHTTP.send(socketPath: socket, method: "GET", path: "/version", body: nil, bearer: nil, timeout: 3) else {
+            LauncherLog.write("clash socket unreachable \(socket)")
+            return
+        }
+        var bearer: String?
+        if probe.status == 401 {
+            for secret in secrets {
+                guard let authed = UnixSocketHTTP.send(socketPath: socket, method: "GET", path: "/version", body: nil, bearer: secret, timeout: 3),
+                      (200..<300).contains(authed.status) else { continue }
+                bearer = secret
+                probe = authed
+                break
+            }
+        }
+        if !(200..<300).contains(probe.status),
+           let root = UnixSocketHTTP.send(socketPath: socket, method: "GET", path: "/", body: nil, bearer: bearer, timeout: 3),
+           (200..<300).contains(root.status) {
+            probe = root
+        }
+        guard (200..<300).contains(probe.status) else {
+            LauncherLog.write("clash version status=\(probe.status) socket=\(socket)")
+            return
+        }
+        result.sawClash = true
+        LauncherLog.write("clash controller reachable \(socket)")
+
+        var tunEnabled: Bool?
+        if let configs = UnixSocketHTTP.send(socketPath: socket, method: "GET", path: "/configs", body: nil, bearer: bearer, timeout: 3),
+           (200..<300).contains(configs.status),
+           let runtime = ClashRuntimeParser.parse(configs.body) {
+            result.ports.formUnion(runtime.ports)
+            tunEnabled = runtime.tunEnabled
+        }
+        if tunEnabled == false {
+            result.notes.append("Clash 内核在运行，TUN 已关闭")
+            return
+        }
+
+        let body = Data(ClashRuntimeParser.disableTunBody.utf8)
+        let patched = UnixSocketHTTP.send(socketPath: socket, method: "PATCH", path: "/configs", body: body, bearer: bearer, timeout: 5)
+        if let patched, (200..<300).contains(patched.status) {
+            result.notes.append("已关闭 Clash TUN")
+            _ = UnixSocketHTTP.send(socketPath: socket, method: "DELETE", path: "/connections", body: nil, bearer: bearer, timeout: 3)
+            LauncherLog.write("clash tun disabled \(socket)")
+        } else {
+            LauncherLog.write("clash tun patch failed status=\(patched?.status ?? -1) socket=\(socket)")
+        }
+    }
+
+    private static func candidateSockets(extra: [String]) -> [String] {
+        var paths = extra
+        let ps = Shell.run("/bin/ps", ["-axww", "-o", "command="], timeout: 5)
+        paths.append(contentsOf: ClashProcess.controllerSockets(fromPS: ps.output))
+        paths.append("/var/run/clash-verge-service/users/\(getuid())/verge-mihomo.sock")
+        paths.append("/tmp/verge/verge-mihomo.sock")
+        if let tmp = getenv("TMPDIR") {
+            paths.append(URL(fileURLWithPath: String(cString: tmp)).appendingPathComponent("verge-mihomo.sock").path)
+        }
+        return uniqueStrings(paths.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter(pathExists)
+    }
+
+    private static func configFiles() -> (sockets: [String], secrets: [String]) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let bundles = [
+            "io.github.clash-verge-rev.clash-verge-rev",
+            "io.github.clash-verge-rev.clash-verge-rev.dev"
+        ]
+        var sockets: [String] = []
+        var secrets: [String] = []
+        for bundle in bundles {
+            for name in ["clash-verge.yaml", "config.yaml"] {
+                let path = "\(home)/Library/Application Support/\(bundle)/\(name)"
+                guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+                if let socket = ClashYAML.externalControllerUnix(in: text) { sockets.append(socket) }
+                if let secret = ClashYAML.secret(in: text) { secrets.append(secret) }
+            }
+        }
+        LauncherLog.write("clash config sockets=\(sockets.count)")
+        return (sockets, uniqueStrings(secrets))
+    }
+}
+
+enum SystemProxyCleaner {
+    static func disableLoopbackClashProxies(ports: Set<Int>) -> Result<String, Error> {
+        guard !ports.isEmpty else { return .success("") }
+        let list = Shell.run("/usr/sbin/networksetup", ["-listallnetworkservices"], timeout: 8)
+        guard list.status == 0 else {
+            LauncherLog.write("networksetup list failed status=\(list.status)")
+            return .success("")
+        }
+        var disabled: [String] = []
+        var leftover: (service: String, server: String, port: Int)?
+        for service in NetworkServiceList.parse(list.output) {
+            let kinds: [(get: String, set: String, label: String)] = [
+                ("-getwebproxy", "-setwebproxystate", "网页"),
+                ("-getsecurewebproxy", "-setsecurewebproxystate", "安全网页"),
+                ("-getsocksfirewallproxy", "-setsocksfirewallproxystate", "SOCKS")
+            ]
+            for kind in kinds {
+                let info = Shell.run("/usr/sbin/networksetup", [kind.get, service], timeout: 8)
+                guard let setting = SystemProxyParser.parse(info.output),
+                      setting.enabled,
+                      SystemProxyParser.isLoopback(setting.server),
+                      ports.contains(setting.port) else { continue }
+                let off = Shell.run("/usr/sbin/networksetup", [kind.set, service, "off"], timeout: 8)
+                let again = Shell.run("/usr/sbin/networksetup", [kind.get, service], timeout: 8)
+                let stillOn = SystemProxyParser.parse(again.output)?.enabled == true
+                if off.status == 0 && !stillOn {
+                    disabled.append("\(service) \(kind.label):\(setting.port)")
+                    LauncherLog.write("system proxy off service=\(service) kind=\(kind.label) port=\(setting.port)")
+                } else if stillOn {
+                    leftover = (service, setting.server, setting.port)
+                    LauncherLog.write("system proxy remains service=\(service) port=\(setting.port) status=\(off.status)")
+                }
+            }
+        }
+        if let leftover {
+            return .failure(launcherError(ClashMessages.proxyRemains(server: leftover.server, port: leftover.port, service: leftover.service), code: 33))
+        }
+        if disabled.isEmpty { return .success("") }
+        return .success("已关闭系统代理（\(disabled.joined(separator: "、"))）")
+    }
+}
+
+// MARK: - Tailscale command line
+
+enum TailscaleCLI {
+    static func resolve() -> String? {
+        let candidates = [
+            "/usr/local/bin/tailscale",
+            "/opt/homebrew/bin/tailscale",
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        let which = Shell.run("/usr/bin/which", ["tailscale"], timeout: 3)
+        let found = which.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if which.status == 0, found.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: found) {
+            return found
+        }
+        return nil
     }
 }
 
@@ -170,6 +473,17 @@ enum StepState {
     case running
     case success
     case failure
+    case warning
+
+    var logName: String {
+        switch self {
+        case .idle: return "idle"
+        case .running: return "running"
+        case .success: return "success"
+        case .failure: return "failure"
+        case .warning: return "warning"
+        }
+    }
 }
 
 struct WorkflowStep: Identifiable {
@@ -180,12 +494,7 @@ struct WorkflowStep: Identifiable {
 }
 
 final class WorkflowModel: ObservableObject {
-    @Published var steps: [WorkflowStep] = [
-        WorkflowStep(id: 0, title: "关闭其他 VPN", detail: "Clash、Shadowrocket 等", state: .idle),
-        WorkflowStep(id: 1, title: "启动并连接 Tailscale", detail: "等待 VPN 连通", state: .idle),
-        WorkflowStep(id: 2, title: "检测出口 IP", detail: "由 App 直接检测", state: .idle),
-        WorkflowStep(id: 3, title: "自动启动 Claude", detail: "仅支持地区自动启动", state: .idle)
-    ]
+    @Published var steps: [WorkflowStep] = WorkflowModel.makeSteps()
     @Published var isRunning = false
     @Published var summary = "点击上方按钮，按顺序准备并启动"
     @Published var ipDisplay = "尚未检测"
@@ -197,6 +506,7 @@ final class WorkflowModel: ObservableObject {
         reset()
         isRunning = true
         summary = "正在执行准备流程…"
+        LauncherLog.write("workflow start version=\(LauncherVersion.marketing)")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.performFullWorkflow()
         }
@@ -207,50 +517,58 @@ final class WorkflowModel: ObservableObject {
         reset()
         steps[0].detail = "手动启动：跳过此步骤"
         steps[1].detail = "手动启动：跳过此步骤"
-        steps[3] = WorkflowStep(id: 3, title: "手动启动 Claude", detail: "等待出口检测结果", state: .idle)
+        steps[4] = WorkflowStep(id: 4, title: "手动启动 Claude", detail: "等待出口检测结果", state: .idle)
         isRunning = true
         setStep(2, state: .running, detail: "正在检测 Claude 出口…")
         setStep(3, state: .idle, detail: "等待地区判断")
+        setStep(4, state: .idle, detail: "等待地区判断")
         updateSummary("手动启动前，正在重新检测出口 IP…")
+        LauncherLog.write("manual launch start version=\(LauncherVersion.marketing)")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.performIPCheckAndLaunch()
         }
     }
 
-    private func reset() {
-        steps = [
+    private static func makeSteps() -> [WorkflowStep] {
+        [
             WorkflowStep(id: 0, title: "关闭其他 VPN", detail: "Clash、Shadowrocket 等", state: .idle),
-            WorkflowStep(id: 1, title: "启动并连接 Tailscale", detail: "等待 VPN 连通", state: .idle),
+            WorkflowStep(id: 1, title: "启动并连接 Tailscale", detail: "以 Tailscale 后端状态为准", state: .idle),
             WorkflowStep(id: 2, title: "检测出口 IP", detail: "由 App 直接检测", state: .idle),
-            WorkflowStep(id: 3, title: "自动启动 Claude", detail: "仅支持地区自动启动", state: .idle)
+            WorkflowStep(id: 3, title: "附加检查", detail: "时区、DNS、IPv6，仅提示", state: .idle),
+            WorkflowStep(id: 4, title: "自动启动 Claude", detail: "仅支持地区自动启动", state: .idle)
         ]
+    }
+
+    private func reset() {
+        steps = Self.makeSteps()
         ipDisplay = "尚未检测"
     }
 
     private func performFullWorkflow() {
         setStep(0, state: .running, detail: "正在关闭其他 VPN…")
         switch closeOtherVPNs() {
-        case .success(let closed):
-            let detail = closed.isEmpty ? "未发现正在运行的其他 VPN" : "已处理：\(closed.joined(separator: "、"))"
+        case .success(let detail):
             setStep(0, state: .success, detail: detail)
         case .failure(let error):
             setStep(0, state: .failure, detail: error.localizedDescription)
             setStep(1, state: .idle, detail: "上一步失败，未连接")
             setStep(2, state: .idle, detail: "尚未检测")
-            setStep(3, state: .idle, detail: "尚未启动")
+            setStep(3, state: .idle, detail: "尚未检查")
+            setStep(4, state: .idle, detail: "尚未启动")
             finish("关闭其他 VPN 失败，已停止流程")
             return
         }
 
-        setStep(1, state: .running, detail: "正在启动 Tailscale…")
+        setStep(1, state: .running, detail: "正在确认 Tailscale 后端…")
         switch connectTailscale() {
         case .success(let message):
             setStep(1, state: .success, detail: message)
         case .failure(let error):
             setStep(1, state: .failure, detail: error.localizedDescription)
             setStep(2, state: .idle, detail: "Tailscale 连通后再检测")
-            setStep(3, state: .idle, detail: "尚未启动")
-            finish("Tailscale 没有连上，请在菜单栏确认后重试")
+            setStep(3, state: .idle, detail: "尚未检查")
+            setStep(4, state: .idle, detail: "尚未启动")
+            finish("Tailscale 没有连上，请看这一步的说明后重试")
             return
         }
 
@@ -258,9 +576,10 @@ final class WorkflowModel: ObservableObject {
         performIPCheckAndLaunch()
     }
 
-    private func closeOtherVPNs() -> Result<[String], Error> {
+    private func closeOtherVPNs() -> Result<String, Error> {
         let knownBundleIDs: Set<String> = [
             "io.github.clash-verge-rev.clash-verge-rev",
+            "io.github.clash-verge-rev.clash-verge-rev.dev",
             "com.follow.clash",
             "com.liguangming.Shadowrocket",
             "com.wwss.WWSS",
@@ -290,84 +609,253 @@ final class WorkflowModel: ObservableObject {
             for app in targeted where !app.isTerminated { _ = app.forceTerminate() }
         }
         Thread.sleep(forTimeInterval: 0.4)
-        let stillRunning = targeted.filter { !$0.isTerminated }.compactMap(\NSRunningApplication.localizedName)
+        let stillRunning = targeted.filter { !$0.isTerminated }.compactMap(\.localizedName)
         if !stillRunning.isEmpty {
-            return .failure(NSError(domain: "ClaudeLauncher", code: 30, userInfo: [NSLocalizedDescriptionKey: "未能退出：\(stillRunning.joined(separator: "、"))"]))
+            LauncherLog.write("vpn apps still running \(stillRunning.joined(separator: ","))")
+            return .failure(launcherError("未能退出：\(stillRunning.joined(separator: "、"))", code: 30))
+        }
+
+        let sawClashApp = targeted.contains { app in
+            let bundleID = (app.bundleIdentifier ?? "").lowercased()
+            let name = (app.localizedName ?? "").lowercased()
+            return bundleID.contains("clash") || name.contains("clash") || name.contains("verge")
         }
 
         let listResult = Shell.run("/usr/sbin/scutil", ["--nc", "list"])
         guard listResult.status == 0 else {
-            return .failure(NSError(domain: "ClaudeLauncher", code: 31, userInfo: [NSLocalizedDescriptionKey: "无法读取 VPN 服务列表：\(listResult.output)"]))
+            return .failure(launcherError("无法读取 VPN 服务列表：\(listResult.output)", code: 31))
         }
         let serviceNames = VPNServiceParser.serviceNames(from: listResult.output, excluding: tailscaleName)
         for service in serviceNames {
             let stopped = Shell.run("/usr/sbin/scutil", ["--nc", "stop", service], timeout: 8)
             guard stopped.status == 0 else {
-                return .failure(NSError(domain: "ClaudeLauncher", code: 32, userInfo: [NSLocalizedDescriptionKey: "停止 VPN 服务 \(service) 失败：\(stopped.output)"]))
+                return .failure(launcherError("停止 VPN 服务 \(service) 失败：\(stopped.output)", code: 32))
             }
         }
 
-        let appNames = targeted.compactMap(\NSRunningApplication.localizedName)
-        return .success(Array(Set(appNames + serviceNames)).sorted())
+        let captureBefore = ClashController.capturePresent()
+        LauncherLog.write("clash capture before=\(captureBefore) app=\(sawClashApp)")
+        let silence = ClashController.silence()
+        let involved = silence.sawClash || captureBefore || sawClashApp
+        if involved {
+            let deadline = Date().addingTimeInterval(6)
+            var present = ClashController.capturePresent()
+            while present && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.4)
+                present = ClashController.capturePresent()
+            }
+            LauncherLog.write("clash capture after=\(present)")
+            if present {
+                return .failure(launcherError(ClashMessages.tunRemains, code: 34))
+            }
+            var ports = silence.ports
+            ports.formUnion([7890, 7891, 7892, 7893, 7897, 7898, 7899])
+            switch SystemProxyCleaner.disableLoopbackClashProxies(ports: ports) {
+            case .failure(let error):
+                return .failure(error)
+            case .success(let note):
+                if !note.isEmpty {
+                    var notes = silence.notes
+                    notes.append(note)
+                    return successDetail(apps: targeted, services: serviceNames, notes: notes)
+                }
+            }
+        }
+
+        return successDetail(apps: targeted, services: serviceNames, notes: silence.notes)
+    }
+
+    private func successDetail(apps: [NSRunningApplication], services: [String], notes: [String]) -> Result<String, Error> {
+        var pieces: [String] = []
+        let appNames = uniqueStrings(apps.compactMap(\.localizedName))
+        if !appNames.isEmpty { pieces.append(appNames.joined(separator: "、")) }
+        if !services.isEmpty { pieces.append(services.joined(separator: "、")) }
+        pieces.append(contentsOf: notes)
+        if pieces.isEmpty { return .success("未发现正在运行的其他 VPN") }
+        return .success("已处理：\(pieces.joined(separator: "；"))")
     }
 
     private func connectTailscale() -> Result<String, Error> {
+        // Readiness comes from `tailscale status --json`, not `scutil --nc status`.
+        // On Demand can mark the system VPN connected while BackendState is Stopped.
         let appPath = "/Applications/Tailscale.app"
         guard FileManager.default.fileExists(atPath: appPath) else {
-            return .failure(NSError(domain: "ClaudePrep", code: 10, userInfo: [NSLocalizedDescriptionKey: "没有找到 /Applications/Tailscale.app"]))
+            return .failure(launcherError(TailscaleMessages.appMissing, code: 10))
+        }
+        guard let cli = TailscaleCLI.resolve() else {
+            return .failure(launcherError(TailscaleMessages.cliMissing, code: 13))
+        }
+        LauncherLog.write("tailscale cli=\(cli)")
+
+        if !tailscaleAppIsRunning() {
+            LauncherLog.write("opening Tailscale.app")
+            let opened = Shell.run("/usr/bin/open", [appPath], timeout: 8)
+            guard opened.status == 0 else {
+                return .failure(launcherError("打开 Tailscale 失败：\(opened.output.trimmingCharacters(in: .whitespacesAndNewlines))", code: 11))
+            }
+        } else {
+            LauncherLog.write("Tailscale.app already running")
         }
 
-        let current = Shell.run("/usr/sbin/scutil", ["--nc", "status", tailscaleName], timeout: 5)
-        if current.output.split(whereSeparator: \Character.isNewline).first.map(String.init)?.caseInsensitiveCompare("Connected") == .orderedSame {
-            return .success("Tailscale 已连接")
-        }
+        let prefsResult = Shell.run(cli, ["debug", "prefs"], timeout: 8)
+        let prefs = TailscalePrefsParser.parse(prefsResult.output)
+        LauncherLog.write("prefs wantRunning=\(String(describing: prefs?.wantRunning)) loggedOut=\(String(describing: prefs?.loggedOut)) hasExitNode=\(prefs?.hasExitNode == true)")
 
-        let opened = Shell.run("/usr/bin/open", [appPath], timeout: 8)
-        guard opened.status == 0 else {
-            return .failure(NSError(domain: "ClaudeLauncher", code: 11, userInfo: [NSLocalizedDescriptionKey: "打开 Tailscale 失败：\(opened.output)"]))
-        }
-        Thread.sleep(forTimeInterval: 1.5)
-        let start = Shell.run("/usr/sbin/scutil", ["--nc", "start", tailscaleName], timeout: 10)
+        let started = Date()
+        let deadline = started.addingTimeInterval(30)
+        var upAttempts = 0
+        var upError: String?
+        var upFinishedAt: Date?
+        var last: TailscaleStatus?
+        var sawStatus = false
 
-        for _ in 0..<25 {
-            let status = Shell.run("/usr/sbin/scutil", ["--nc", "status", tailscaleName], timeout: 5)
-            let firstLine = status.output.split(whereSeparator: \Character.isNewline).first.map(String.init) ?? ""
-            if firstLine.caseInsensitiveCompare("Connected") == .orderedSame {
-                return .success("Tailscale 已连接")
+        while Date() < deadline {
+            let statusResult = Shell.run(cli, ["status", "--json"], timeout: 8)
+            if let status = TailscaleStatusParser.parse(statusResult.output) {
+                sawStatus = true
+                last = status
+                LauncherLog.write("backend=\(status.backendState) selfOnline=\(status.selfOnline) exitSet=\(status.exitNode != nil) exitOnline=\(String(describing: status.exitNode?.online))")
+                if status.isReady {
+                    return .success(TailscaleMessages.success(status))
+                }
+                if status.blocker == .notLoggedIn || (prefs?.loggedOut == true && status.backendState.lowercased() != "running") {
+                    return .failure(launcherError(TailscaleMessages.failure(blocker: .notLoggedIn, hasSavedExitNode: prefs?.hasExitNode == true), code: 14))
+                }
+                if status.blocker == .needsMachineAuth {
+                    return .failure(launcherError(TailscaleMessages.failure(blocker: .needsMachineAuth, hasSavedExitNode: false), code: 15))
+                }
+                if status.blocker == .noExitNode {
+                    let anchor = upFinishedAt ?? started
+                    if Date().timeIntervalSince(anchor) > 5 {
+                        return .failure(launcherError(TailscaleMessages.failure(blocker: .noExitNode, hasSavedExitNode: prefs?.hasExitNode == true), code: 16))
+                    }
+                }
+                let loggedOut = prefs?.loggedOut == true || status.loggedOut == true
+                if status.shouldBringUp && !loggedOut && upAttempts < 2 {
+                    upAttempts += 1
+                    LauncherLog.write("bringing tailscale up attempt=\(upAttempts)")
+                    upError = bringTailscaleUp(cli)
+                    upFinishedAt = Date()
+                }
+            } else {
+                let snippet = statusResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                LauncherLog.write("tailscale status unavailable code=\(statusResult.status) output=\(String(snippet.prefix(200)))")
             }
             Thread.sleep(forTimeInterval: 0.8)
         }
-        let reason = start.status == 0 ? "等待 20 秒后仍未连接。请检查 Tailscale 是否已登录并选择出口节点。" : "启动 Tailscale 失败：\(start.output.trimmingCharacters(in: .whitespacesAndNewlines))"
-        return .failure(NSError(domain: "ClaudeLauncher", code: 12, userInfo: [NSLocalizedDescriptionKey: reason]))
+
+        if let last, let blocker = last.blocker {
+            var message = TailscaleMessages.failure(blocker: blocker, hasSavedExitNode: prefs?.hasExitNode == true)
+            if let upError, blocker == .backendStopped || blocker == .starting {
+                message += " \(upError)"
+            }
+            return .failure(launcherError(message, code: 12))
+        }
+        if !sawStatus {
+            var message = TailscaleMessages.serviceUnreachable
+            if let upError { message += " \(upError)" }
+            return .failure(launcherError(message, code: 17))
+        }
+        return .failure(launcherError(TailscaleMessages.failure(blocker: .backendStopped, hasSavedExitNode: prefs?.hasExitNode == true), code: 12))
+    }
+
+    private func bringTailscaleUp(_ cli: String) -> String? {
+        let first = Shell.run(cli, ["up"], timeout: 18)
+        LauncherLog.write("tailscale up status=\(first.status) output=\(String(first.output.prefix(400)))")
+        if first.status == 0 { return nil }
+        if let arguments = TailscaleUpSuggestion.arguments(from: first.output) {
+            LauncherLog.write("tailscale up retry argc=\(arguments.count)")
+            let second = Shell.run(cli, ["up"] + arguments, timeout: 18)
+            LauncherLog.write("tailscale up retry status=\(second.status) output=\(String(second.output.prefix(400)))")
+            if second.status == 0 { return nil }
+            return TailscaleMessages.upFailed(second.output)
+        }
+        return TailscaleMessages.upFailed(first.output)
+    }
+
+    private func tailscaleAppIsRunning() -> Bool {
+        var running = false
+        DispatchQueue.main.sync {
+            running = NSWorkspace.shared.runningApplications.contains { app in
+                let identifier = app.bundleIdentifier ?? ""
+                return identifier == "io.tailscale.ipn.macsys" || identifier == "com.tailscale.ipn.macos"
+            }
+        }
+        return running
     }
 
     private func performIPCheckAndLaunch() {
         switch IPDetector.detect() {
         case .failure(let error):
             setStep(2, state: .failure, detail: error.localizedDescription)
-            setStep(3, state: .idle, detail: "未启动")
+            setStep(3, state: .idle, detail: "尚未检查")
+            setStep(4, state: .idle, detail: "未启动")
             finish("IP 检测失败，Claude App 没有启动")
         case .success(let result):
             let ipVersion = result.trace.ip.contains(":") ? "IPv6" : "IPv4"
             let display = "\(result.trace.ip)  ·  \(result.locationDisplay)  ·  \(ipVersion)"
             DispatchQueue.main.async { [weak self] in self?.ipDisplay = display }
+            LauncherLog.write("egress ip=\(result.trace.ip) loc=\(result.trace.countryCode) allowed=\(result.trace.isSupportedRegion)")
             if result.trace.isSupportedRegion {
                 setStep(2, state: .success, detail: "支持地区：\(result.locationDisplay)（\(result.trace.countryCode)）")
-                setStep(3, state: .running, detail: "正在打开 Claude App…")
+                let warnings = collectExtraWarnings(trace: result.trace, countryName: result.locationDisplay)
+                if warnings.isEmpty {
+                    setStep(3, state: .success, detail: "时区、DNS 和 IPv6 未发现明显问题")
+                } else {
+                    setStep(3, state: .warning, detail: warnings.joined(separator: "；") + "。仅提示，不阻止启动")
+                }
+                setStep(4, state: .running, detail: "正在打开 Claude App…")
                 switch launchClaudeApp() {
                 case .success(let appPath):
-                    setStep(3, state: .success, detail: "已启动：\(appPath)")
-                    finish("出口位于支持地区，Claude App 已启动")
+                    setStep(4, state: .success, detail: "已启动：\(appPath)")
+                    if warnings.isEmpty {
+                        finish("出口位于支持地区，Claude App 已启动")
+                    } else {
+                        finish("出口位于支持地区，Claude App 已启动。另有 \(warnings.count) 条环境提示")
+                    }
                 case .failure(let error):
-                    setStep(3, state: .failure, detail: error.localizedDescription)
+                    setStep(4, state: .failure, detail: error.localizedDescription)
                     finish("地区检测通过，但 Claude App 启动失败")
                 }
             } else {
                 setStep(2, state: .failure, detail: "当前为 \(result.locationDisplay)（\(result.trace.countryCode)），未列入支持地区")
-                setStep(3, state: .idle, detail: "地区未通过：未启动")
+                setStep(3, state: .idle, detail: "地区未通过，跳过")
+                setStep(4, state: .idle, detail: "地区未通过：未启动")
                 finish("当前出口未列入 Claude 支持地区，未启动")
             }
         }
+    }
+
+    private func collectExtraWarnings(trace: TraceResult, countryName: String) -> [String] {
+        let zone = TimeZone.current
+        let dns = Shell.run("/usr/sbin/scutil", ["--dns"], timeout: 6)
+        let ipv6 = probeIPv6Country()
+        let warnings = ExtraCheckReport.warnings(
+            trace: trace,
+            countryName: countryName,
+            now: Date(),
+            timeZoneID: zone.identifier,
+            gmtOffsetMinutes: zone.secondsFromGMT() / 60,
+            dnsOutput: dns.output,
+            ipv6Country: ipv6
+        )
+        LauncherLog.write("extra warnings=\(warnings.count) tz=\(zone.identifier) offsetMin=\(zone.secondsFromGMT() / 60) ipv6=\(ipv6 ?? "none")")
+        return warnings
+    }
+
+    private func probeIPv6Country() -> String? {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/curl") else { return nil }
+        let result = Shell.run("/usr/bin/curl", [
+            "-6", "-sS", "--max-time", "8", "--noproxy", "*",
+            "-H", "Cache-Control: no-cache",
+            "-A", LauncherVersion.userAgent,
+            "https://claude.ai/cdn-cgi/trace"
+        ], timeout: 12)
+        guard result.status == 0, let trace = TraceParser.parse(result.output) else {
+            LauncherLog.write("ipv6 probe none status=\(result.status)")
+            return nil
+        }
+        return trace.countryCode
     }
 
     private func launchClaudeApp() -> Result<String, Error> {
@@ -384,6 +872,7 @@ final class WorkflowModel: ObservableObject {
     }
 
     private func setStep(_ index: Int, state: StepState, detail: String) {
+        LauncherLog.write("step=\(index) state=\(state.logName) \(detail)")
         DispatchQueue.main.async { [weak self] in
             guard let self, self.steps.indices.contains(index) else { return }
             self.steps[index].state = state
@@ -396,11 +885,25 @@ final class WorkflowModel: ObservableObject {
     }
 
     private func finish(_ value: String) {
+        LauncherLog.write("finish \(value)")
         DispatchQueue.main.async { [weak self] in
             self?.summary = value
             self?.isRunning = false
         }
     }
+}
+
+private func launcherError(_ message: String, code: Int) -> NSError {
+    NSError(domain: "ClaudeLauncher", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+private func uniqueStrings(_ values: [String]) -> [String] {
+    var seen: Set<String> = []
+    var result: [String] = []
+    for value in values where !value.isEmpty && seen.insert(value).inserted {
+        result.append(value)
+    }
+    return result
 }
 
 // MARK: - SwiftUI view
@@ -414,6 +917,7 @@ private struct StepRow: View {
         case .running: return .orange
         case .success: return .green
         case .failure: return .red
+        case .warning: return Color(red: 0.85, green: 0.55, blue: 0.05)
         }
     }
 
@@ -423,6 +927,7 @@ private struct StepRow: View {
         case .running: return "…"
         case .success: return "✓"
         case .failure: return "!"
+        case .warning: return "△"
         }
     }
 
@@ -443,8 +948,8 @@ private struct StepRow: View {
                     .foregroundStyle(.primary)
                 Text(step.detail)
                     .font(.system(size: 11.5))
-                    .foregroundStyle(step.state == .failure ? .red : .secondary)
-                    .lineLimit(2)
+                    .foregroundStyle(detailColor)
+                    .lineLimit(4)
             }
             Spacer(minLength: 0)
             if step.state == .running {
@@ -452,6 +957,14 @@ private struct StepRow: View {
             }
         }
         .padding(.vertical, 7)
+    }
+
+    private var detailColor: Color {
+        switch step.state {
+        case .failure: return .red
+        case .warning: return Color(red: 0.72, green: 0.42, blue: 0.05)
+        default: return .secondary
+        }
     }
 }
 
@@ -504,7 +1017,7 @@ struct ContentView: View {
 
                 ForEach(model.steps) { step in
                     StepRow(step: step)
-                    if step.id < 3 { Divider().opacity(0.55) }
+                    if step.id != model.steps.last?.id { Divider().opacity(0.55) }
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -540,11 +1053,18 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .padding(.top, 10)
 
+                Text(LauncherLog.displayPath)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
+
                 Text("版本 \(appVersion)")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, alignment: .trailing)
-                    .padding(.top, 5)
+                    .padding(.top, 2)
             }
             .padding(.horizontal, 18)
             .padding(.top, 8)
@@ -607,7 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func buildWindow() {
         let hosting = NSHostingController(rootView: ContentView(model: model))
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 372, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 372, height: 680),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -619,6 +1139,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.delegate = self
+        hosting.view.layoutSubtreeIfNeeded()
+        let fitted = hosting.view.fittingSize
+        if fitted.width > 200 && fitted.height > 200 {
+            window.setContentSize(fitted)
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -633,38 +1158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 }
 
-// MARK: - Test and command-line modes
-
-func runSelfTests() -> Int32 {
-    var failures: [String] = []
-
-    let us = TraceParser.parse("ip=8.8.8.8\nloc=US\nwarp=off\n")
-    if us != TraceResult(ip: "8.8.8.8", countryCode: "US") || us?.isSupportedRegion != true {
-        failures.append("US trace parsing")
-    }
-    let tw = TraceParser.parse("fl=x\nip=61.221.84.27\nloc=TW\n")
-    if tw?.isSupportedRegion != true { failures.append("supported non-US region") }
-    let cn = TraceParser.parse("ip=1.1.1.1\nloc=CN\n")
-    if cn?.isSupportedRegion != false { failures.append("unsupported region gate") }
-    if SupportedRegions.codes.count != 176 { failures.append("supported region list count") }
-    if TraceParser.parse("ip=1.1.1.1\n") != nil { failures.append("missing loc rejection") }
-
-    let sampleServices = """
-    * (Disconnected) ABC VPN (com.test) \"Shadowrocket\" [VPN:com.test]
-    * (Connected) GHI VPN (com.clash) \"Clash Verge\" [VPN:com.clash]
-    * (Connected) DEF VPN (io.tailscale.ipn.macsys) \"Tailscale\" [VPN:io.tailscale.ipn.macsys]
-    """
-    if VPNServiceParser.serviceNames(from: sampleServices, excluding: "Tailscale") != ["Clash Verge"] {
-        failures.append("VPN service parsing")
-    }
-
-    if failures.isEmpty {
-        print("SELF-TEST PASS: trace parsing, supported-region gate, and VPN service parsing")
-        return 0
-    }
-    print("SELF-TEST FAIL: \(failures.joined(separator: ", "))")
-    return 1
-}
+// MARK: - Command-line modes
 
 if CommandLine.arguments.contains("--self-test") {
     exit(runSelfTests())
@@ -688,4 +1182,3 @@ let application = NSApplication.shared
 let delegate = AppDelegate()
 application.delegate = delegate
 application.run()
-
