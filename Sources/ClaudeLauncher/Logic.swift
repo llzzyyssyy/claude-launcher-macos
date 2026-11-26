@@ -5,8 +5,8 @@ import Foundation
 // Self-tests cover the parsers so the VPN decisions can be checked without a Mac.
 
 enum LauncherVersion {
-    static let marketing = "1.1.3"
-    static let userAgent = "ClaudeLauncher/1.1.3"
+    static let marketing = "1.1.4"
+    static let userAgent = "ClaudeLauncher/1.1.4"
 }
 
 // MARK: - Trace and supported regions
@@ -285,6 +285,17 @@ enum TailscaleUpSuggestion {
     }
 }
 
+enum TailscaleShutdown {
+    /// `tailscale down` sets WantRunning to false and stops using the exit node.
+    /// It does not clear the saved exit-node preference, and it must not pass --reset.
+    static let downArguments = ["down"]
+
+    static func isDown(_ status: TailscaleStatus) -> Bool {
+        let state = status.backendState.lowercased()
+        return state != "running" && state != "starting"
+    }
+}
+
 enum TailscaleMessages {
     static let appMissing = "没有找到 /Applications/Tailscale.app"
     static let cliMissing = "找不到 tailscale 命令。请确认已安装 Tailscale（/usr/local/bin/tailscale、Homebrew，或 App 内的命令行）"
@@ -329,6 +340,16 @@ enum TailscaleMessages {
         let redacted = LogRedactor.redact(snippet)
         if redacted.isEmpty { return "tailscale up 失败" }
         return "tailscale up 失败：\(String(redacted.prefix(160)))"
+    }
+
+    static func downFailed(_ output: String) -> String {
+        let snippet = output
+            .split(whereSeparator: \Character.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        let redacted = LogRedactor.redact(snippet)
+        if redacted.isEmpty { return "tailscale down 失败" }
+        return "tailscale down 失败：\(String(redacted.prefix(160)))"
     }
 }
 
@@ -1030,6 +1051,16 @@ func runSelfTests() -> Int32 {
     expect(!leaked.contains("tskey-auth-abc"), "redact auth key")
     expect(!leaked.contains("secret-token"), "redact tailscale login url")
     expect(leaked.contains("Tailscale 已运行"), "keep ordinary log text")
+
+    let stoppedBackend = TailscaleStatusParser.parse(#"{"BackendState":"Stopped","WantRunning":false,"Self":{"Online":false}}"#)
+    expect(stoppedBackend.map(TailscaleShutdown.isDown) == true, "stopped backend is down")
+    let startingBackend = TailscaleStatusParser.parse(#"{"BackendState":"Starting","Self":{"Online":false}}"#)
+    expect(startingBackend.map(TailscaleShutdown.isDown) == false, "starting backend is not down yet")
+    expect(running.map(TailscaleShutdown.isDown) == false, "running backend is not down")
+    let needsLoginDown = TailscaleStatusParser.parse(#"{"BackendState":"NeedsLogin","Self":{"Online":false}}"#)
+    expect(needsLoginDown.map(TailscaleShutdown.isDown) == true, "logged-out backend is not running")
+    expect(TailscaleShutdown.downArguments == ["down"], "down keeps saved exit node")
+    expect(!TailscaleShutdown.downArguments.contains("--reset"), "down does not reset prefs")
 
     if failures.isEmpty {
         print("SELF-TEST PASS: trace, regions, VPN list, tailscale status, clash audit, DNS, timezone, redaction")

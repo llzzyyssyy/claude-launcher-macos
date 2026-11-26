@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4 - 2026-11-26
+
+- Added a one-click shutdown. It quits Claude, runs `tailscale down` (WantRunning false, saved exit node kept, no `--reset`), then quits Tailscale.app.
+- Shutdown confirms `BackendState` is no longer Running. It does not turn Clash or its TUN back on.
+- The system VPN switch can stay on because Tailscale rewrites On Demand. Traffic stops using the exit node once the backend is down.
+
 ## 1.1.3 - 2026-11-26
 
 - Tailscale readiness now comes from `tailscale status --json`: the backend is Running, this Mac is online, and an exit node is selected and online. The system VPN switch is ignored, because On Demand can report Connected while the backend is Stopped.

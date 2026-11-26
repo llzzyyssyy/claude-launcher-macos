@@ -11,6 +11,7 @@
 ## 功能
 
 - 一键执行流程：关闭其他 VPN → 确认 Tailscale 后端和出口节点 → 检测出口 IP → 启动 Claude。
+- 一键关闭：退出 Claude，执行 `tailscale down`，再退出 Tailscale。不重新打开 Clash，也不清掉已经保存的出口节点。
 - 用 `tailscale status --json` 判断是否已连上，不看系统 VPN 开关。系统里的 Tailscale 配置开着“按需连接”时，菜单栏 App 没开、后端仍是 Stopped，开关也会显示已连接。
 - 提供“手动启动 Claude”，跳过 VPN 操作，但启动前仍重新检测出口地区。
 - 直接请求 `https://claude.ai/cdn-cgi/trace`，不打开第三方 IP 检测网页。
@@ -71,12 +72,14 @@ codesign --verify --deep --strict --verbose=2 ./build/Claude\ 启动器.app
 3. 若 Tailscale App 没在运行就打开它。随后只看 `tailscale status --json`：后端是 Running、本机在线，且当前出口节点在线。后端停着时执行不带参数的 `tailscale up`，沿用已经保存的出口节点；如果旧版命令要求带上全部非默认参数，就按它打印出的那条命令原样再执行一次，不使用 `--reset`。不会写死出口节点的名字。
 4. 请求 Claude 的 Cloudflare trace 端点，读取这次请求的出口 IP 和两位地区代码，对照内置的支持地区快照。通过才打开 `/Applications/Claude.app`。
 5. 地区通过之后检查三项环境差异，只提示、不拦截：系统时区是否落在出口地区的常见时区里，系统 DNS 是否仍指向中国大陆或局域网解析器，以及 IPv6 出口地区是否和主出口不一致。桌面端没有浏览器 WebRTC，不做这项检查。
+6. 一键关闭按顺序退出 `/Applications/Claude.app`、执行 `tailscale down`、再退出 Tailscale App。`tailscale down` 让后端不再运行，流量不再走出口节点，下次一键启动仍能用原来保存的出口节点。Tailscale 每次启动都会重新打开“按需连接”，所以系统 VPN 开关可能仍显示已连接；只要 `tailscale status --json` 里的后端不是 Running，就不再经由出口节点。这一步不会把 Clash 或 TUN 重新打开。
 
 支持地区快照于 2026-11-11 根据 [Claude Help Center](https://support.claude.com/en/articles/8461763-where-can-i-access-claude) 核对。官方名单可能变化，更新时需要同步修改 `SupportedRegions.codes`。
 
 ## 使用前须知
 
 - “一键启动”会退出匹配到的 VPN 应用，并可能关掉 Clash 的 TUN 和指向本机 Clash 端口的系统代理。请先保存相关应用中的未完成操作。
+- “一键关闭”只退出 Claude 和 Tailscale。Clash 保持关闭前的样子，需要时请自己再打开。系统 VPN 列表里的 Tailscale 开关可能仍显示已连接，那是按需连接留下的状态，不代表出口节点还在转发。
 - 地区检测只能证明这一次 HTTPS 请求看到的出口地区，不能判断 Claude 账号状态，也不能保证桌面端的所有连接走同一路由。
 - 时区、DNS 和 IPv6 提示同样只描述这一次看到的环境，不会因为提示而取消启动。
 - 日志在 `~/Library/Logs/ClaudeLauncher/launcher.log`。里面有每一步的结果，没有 Tailscale 私钥或 Clash 密钥。

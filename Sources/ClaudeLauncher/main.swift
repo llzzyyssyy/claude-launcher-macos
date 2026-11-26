@@ -496,6 +496,7 @@ struct WorkflowStep: Identifiable {
 final class WorkflowModel: ObservableObject {
     @Published var steps: [WorkflowStep] = WorkflowModel.makeSteps()
     @Published var isRunning = false
+    @Published var isShuttingDown = false
     @Published var summary = "点击上方按钮，按顺序准备并启动"
     @Published var ipDisplay = "尚未检测"
 
@@ -529,6 +530,19 @@ final class WorkflowModel: ObservableObject {
         }
     }
 
+    func shutDown() {
+        guard !isRunning else { return }
+        steps = Self.makeShutdownSteps()
+        ipDisplay = "本次关闭不检测出口"
+        isRunning = true
+        isShuttingDown = true
+        summary = "正在关闭 Claude 和 Tailscale…"
+        LauncherLog.write("shutdown start version=\(LauncherVersion.marketing)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.performShutdown()
+        }
+    }
+
     private static func makeSteps() -> [WorkflowStep] {
         [
             WorkflowStep(id: 0, title: "关闭其他 VPN", detail: "Clash、Shadowrocket 等", state: .idle),
@@ -536,6 +550,14 @@ final class WorkflowModel: ObservableObject {
             WorkflowStep(id: 2, title: "检测出口 IP", detail: "由 App 直接检测", state: .idle),
             WorkflowStep(id: 3, title: "附加检查", detail: "时区、DNS、IPv6，仅提示", state: .idle),
             WorkflowStep(id: 4, title: "自动启动 Claude", detail: "仅支持地区自动启动", state: .idle)
+        ]
+    }
+
+    private static func makeShutdownSteps() -> [WorkflowStep] {
+        [
+            WorkflowStep(id: 0, title: "退出 Claude", detail: "仅退出 /Applications/Claude.app", state: .idle),
+            WorkflowStep(id: 1, title: "断开 Tailscale", detail: "tailscale down，保留出口节点设置", state: .idle),
+            WorkflowStep(id: 2, title: "退出 Tailscale", detail: "后端停止后再退出 App", state: .idle)
         ]
     }
 
@@ -574,6 +596,52 @@ final class WorkflowModel: ObservableObject {
 
         setStep(2, state: .running, detail: "正在检测 Claude 出口…")
         performIPCheckAndLaunch()
+    }
+
+    private func performShutdown() {
+        LauncherLog.write("shutdown leaves Clash untouched")
+        var problems: [String] = []
+
+        setStep(0, state: .running, detail: "正在退出 Claude…")
+        switch quitApplication(
+            at: "/Applications/Claude.app",
+            bundleIDs: ["com.anthropic.claudefordesktop"],
+            displayName: "Claude"
+        ) {
+        case .success(let detail):
+            setStep(0, state: .success, detail: detail)
+        case .failure(let error):
+            setStep(0, state: .failure, detail: error.localizedDescription)
+            problems.append(error.localizedDescription)
+        }
+
+        setStep(1, state: .running, detail: "正在执行 tailscale down…")
+        let backend = stopTailscaleBackend()
+        switch backend {
+        case .success(let detail):
+            setStep(1, state: .success, detail: detail)
+        case .failure(let error):
+            setStep(1, state: .failure, detail: error.localizedDescription)
+            problems.append(error.localizedDescription)
+        }
+
+        setStep(2, state: .running, detail: "正在退出 Tailscale…")
+        switch quitTailscaleApp(backendWasDown: {
+            if case .success = backend { return true }
+            return false
+        }()) {
+        case .success(let detail):
+            setStep(2, state: .success, detail: detail)
+        case .failure(let error):
+            setStep(2, state: .failure, detail: error.localizedDescription)
+            problems.append(error.localizedDescription)
+        }
+
+        if problems.isEmpty {
+            finish("Claude 和 Tailscale 已关闭。Clash 保持原样，需要时请自行打开")
+        } else {
+            finish("关闭未完成：\(problems.joined(separator: "；"))")
+        }
     }
 
     private func closeOtherVPNs() -> Result<String, Error> {
@@ -889,7 +957,118 @@ final class WorkflowModel: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.summary = value
             self?.isRunning = false
+            self?.isShuttingDown = false
         }
+    }
+
+    private func quitApplication(at bundlePath: String, bundleIDs: Set<String>, displayName: String) -> Result<String, Error> {
+        var matches: [NSRunningApplication] = []
+        DispatchQueue.main.sync {
+            matches = NSWorkspace.shared.runningApplications.filter { app in
+                if let identifier = app.bundleIdentifier, bundleIDs.contains(identifier) { return true }
+                let path = app.bundleURL?.path ?? ""
+                return path == bundlePath || path.hasPrefix(bundlePath + "/")
+            }
+            for app in matches { _ = app.terminate() }
+        }
+        if matches.isEmpty {
+            LauncherLog.write("quit \(displayName) not running")
+            return .success("\(displayName) 未在运行")
+        }
+        Thread.sleep(forTimeInterval: 1.2)
+        DispatchQueue.main.sync {
+            for app in matches where !app.isTerminated { _ = app.forceTerminate() }
+        }
+        Thread.sleep(forTimeInterval: 0.4)
+        let still = matches.filter { !$0.isTerminated }.compactMap(\.localizedName)
+        if !still.isEmpty {
+            LauncherLog.write("quit \(displayName) still running")
+            return .failure(launcherError("未能退出 \(displayName)", code: 45))
+        }
+        LauncherLog.write("quit \(displayName) ok")
+        return .success("已退出 \(displayName)")
+    }
+
+    private func stopTailscaleBackend() -> Result<String, Error> {
+        guard let cli = TailscaleCLI.resolve() else {
+            return .failure(launcherError(TailscaleMessages.cliMissing, code: 40))
+        }
+        LauncherLog.write("tailscale down cli=\(cli)")
+        let down = Shell.run(cli, TailscaleShutdown.downArguments, timeout: 20)
+        LauncherLog.write("tailscale down status=\(down.status) output=\(String(down.output.prefix(400)))")
+
+        let deadline = Date().addingTimeInterval(15)
+        var last: TailscaleStatus?
+        while Date() < deadline {
+            let statusResult = Shell.run(cli, ["status", "--json"], timeout: 8)
+            if let status = TailscaleStatusParser.parse(statusResult.output) {
+                last = status
+                LauncherLog.write("shutdown backend=\(status.backendState) wantRunning=\(String(describing: status.wantRunning))")
+                if TailscaleShutdown.isDown(status) {
+                    let prefsResult = Shell.run(cli, ["debug", "prefs"], timeout: 8)
+                    let prefs = TailscalePrefsParser.parse(prefsResult.output)
+                    LauncherLog.write("shutdown prefs wantRunning=\(String(describing: prefs?.wantRunning)) hasExitNode=\(prefs?.hasExitNode == true)")
+                    if prefs?.wantRunning == true {
+                        return .failure(launcherError("tailscale down 之后后端仍要求保持运行", code: 41))
+                    }
+                    let kept = prefs?.hasExitNode == true ? "原来的出口节点设置已保留" : "后端已停止"
+                    return .success("后端已停止（\(status.backendState)）。\(kept)")
+                }
+            } else {
+                let snippet = statusResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                LauncherLog.write("shutdown status unavailable code=\(statusResult.status) output=\(String(snippet.prefix(200)))")
+            }
+            Thread.sleep(forTimeInterval: 0.6)
+        }
+        if let last {
+            return .failure(launcherError("Tailscale 后端仍是 \(last.backendState)，出口还可能在转发流量", code: 42))
+        }
+        if down.status != 0 {
+            return .failure(launcherError(TailscaleMessages.downFailed(down.output), code: 43))
+        }
+        return .failure(launcherError("无法确认 Tailscale 后端已停止", code: 44))
+    }
+
+    private func quitTailscaleApp(backendWasDown: Bool) -> Result<String, Error> {
+        let quit = quitApplication(
+            at: "/Applications/Tailscale.app",
+            bundleIDs: ["io.tailscale.ipn.macsys", "com.tailscale.ipn.macos"],
+            displayName: "Tailscale"
+        )
+        if case .failure(let error) = quit {
+            return .failure(error)
+        }
+        guard let cli = TailscaleCLI.resolve() else {
+            if backendWasDown {
+                return .success("\(quitMessage(quit))。关闭前后端已停止")
+            }
+            return .failure(launcherError("已退出 Tailscale，但找不到命令行，无法确认后端已停止", code: 46))
+        }
+        var last: TailscaleStatus?
+        for _ in 0..<4 {
+            let statusResult = Shell.run(cli, ["status", "--json"], timeout: 5)
+            if let status = TailscaleStatusParser.parse(statusResult.output) {
+                last = status
+                LauncherLog.write("shutdown after quit backend=\(status.backendState)")
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        let quitDetail = quitMessage(quit)
+        if let last {
+            if TailscaleShutdown.isDown(last) {
+                return .success("\(quitDetail)。系统 VPN 开关若仍显示已连接，那是按需连接留下的状态，流量已不再走出口节点")
+            }
+            return .failure(launcherError("退出 Tailscale 后后端仍是 \(last.backendState)，出口还可能在转发流量", code: 47))
+        }
+        if backendWasDown {
+            return .success("\(quitDetail)。退出后已读不到 Tailscale 状态，关闭前后端已停止。系统 VPN 开关若仍显示已连接，流量已不再走出口节点")
+        }
+        return .failure(launcherError("退出 Tailscale 后无法确认后端已停止", code: 48))
+    }
+
+    private func quitMessage(_ result: Result<String, Error>) -> String {
+        if case .success(let detail) = result { return detail }
+        return "已退出 Tailscale"
     }
 }
 
@@ -1001,9 +1180,9 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 Button(action: model.runAll) {
                     HStack(spacing: 8) {
-                        if model.isRunning { ProgressView().controlSize(.small) }
-                        Image(systemName: model.isRunning ? "hourglass" : "play.fill")
-                        Text(model.isRunning ? "正在执行…" : "一键启动")
+                        if model.isRunning && !model.isShuttingDown { ProgressView().controlSize(.small) }
+                        Image(systemName: model.isRunning && !model.isShuttingDown ? "hourglass" : "play.fill")
+                        Text(model.isRunning && !model.isShuttingDown ? "正在执行…" : "一键启动")
                             .fontWeight(.semibold)
                     }
                     .frame(maxWidth: .infinity)
@@ -1013,7 +1192,28 @@ struct ContentView: View {
                 .tint(Color(red: 0.05, green: 0.55, blue: 0.58))
                 .disabled(model.isRunning)
                 .padding(.top, 14)
-                .padding(.bottom, 9)
+                .padding(.bottom, 6)
+
+                Button(action: model.shutDown) {
+                    HStack(spacing: 8) {
+                        if model.isShuttingDown { ProgressView().controlSize(.small) }
+                        Image(systemName: model.isShuttingDown ? "hourglass" : "stop.fill")
+                        Text(model.isShuttingDown ? "正在关闭…" : "一键关闭")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                }
+                .buttonStyle(.bordered)
+                .tint(Color(red: 0.55, green: 0.24, blue: 0.22))
+                .disabled(model.isRunning)
+                .padding(.bottom, 2)
+
+                Text("关闭 Claude 和 Tailscale，不重新打开 Clash")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.bottom, 6)
 
                 ForEach(model.steps) { step in
                     StepRow(step: step)
