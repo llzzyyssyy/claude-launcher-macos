@@ -1178,35 +1178,40 @@ struct ContentView: View {
             )
 
             VStack(spacing: 0) {
-                Button(action: model.runAll) {
-                    HStack(spacing: 8) {
-                        if model.isRunning && !model.isShuttingDown { ProgressView().controlSize(.small) }
-                        Image(systemName: model.isRunning && !model.isShuttingDown ? "hourglass" : "play.fill")
-                        Text(model.isRunning && !model.isShuttingDown ? "正在执行…" : "一键启动")
-                            .fontWeight(.semibold)
+                HStack(spacing: 8) {
+                    Button(action: model.runAll) {
+                        HStack(spacing: 6) {
+                            if model.isRunning && !model.isShuttingDown { ProgressView().controlSize(.small) }
+                            Image(systemName: model.isRunning && !model.isShuttingDown ? "hourglass" : "play.fill")
+                            Text(model.isRunning && !model.isShuttingDown ? "正在执行…" : "一键启动")
+                                .fontWeight(.semibold)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
                     }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 36)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(Color(red: 0.05, green: 0.55, blue: 0.58))
-                .disabled(model.isRunning)
-                .padding(.top, 14)
-                .padding(.bottom, 6)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .tint(Color(red: 0.05, green: 0.55, blue: 0.58))
+                    .disabled(model.isRunning)
 
-                Button(action: model.shutDown) {
-                    HStack(spacing: 8) {
-                        if model.isShuttingDown { ProgressView().controlSize(.small) }
-                        Image(systemName: model.isShuttingDown ? "hourglass" : "stop.fill")
-                        Text(model.isShuttingDown ? "正在关闭…" : "一键关闭")
-                            .fontWeight(.semibold)
+                    Button(action: model.shutDown) {
+                        HStack(spacing: 6) {
+                            if model.isShuttingDown { ProgressView().controlSize(.small) }
+                            Image(systemName: model.isShuttingDown ? "hourglass" : "stop.fill")
+                            Text(model.isShuttingDown ? "正在关闭…" : "一键关闭")
+                                .fontWeight(.semibold)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 40)
                     }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 32)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .tint(Color(red: 0.82, green: 0.18, blue: 0.18))
+                    .disabled(model.isRunning)
                 }
-                .buttonStyle(.bordered)
-                .tint(Color(red: 0.55, green: 0.24, blue: 0.22))
-                .disabled(model.isRunning)
+                .padding(.top, 14)
                 .padding(.bottom, 2)
 
                 Text("关闭 Claude 和 Tailscale，不重新打开 Clash")

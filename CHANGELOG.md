@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.5 - 2026-11-26
+
+- Made 「一键关闭」 the same size and weight as 「一键启动」: both are filled buttons, side by side at the top. Shutdown uses a red fill. Shutdown behavior is unchanged.
+
 ## 1.1.4 - 2026-11-26
 
 - Added a one-click shutdown. It quits Claude, runs `tailscale down` (WantRunning false, saved exit node kept, no `--reset`), then quits Tailscale.app.
