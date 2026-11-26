@@ -39,8 +39,10 @@ SWIFT_MODULE_CACHE_PATH="$MODULE_CACHE" \
 xcrun swiftc \
   -swift-version 5 \
   -O \
+  -framework CoreFoundation \
   -framework AppKit \
   -framework SwiftUI \
+  "$SCRIPT_DIR/Sources/ClaudeLauncher/Logic.swift" \
   "$SCRIPT_DIR/Sources/ClaudeLauncher/main.swift" \
   -o "$APP_DIR/Contents/MacOS/ClaudeLauncher"
 
