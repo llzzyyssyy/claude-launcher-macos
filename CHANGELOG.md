@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.6 - 2026-11-26
+
+- Restyled 「一键启动」 and 「一键关闭」 as short rectangles with a 7pt corner radius. Launch is a quiet accent fill; shutdown is a tinted outline instead of a solid red pill. Removed the caption under the buttons; that note is now the shutdown button’s help text. Shutdown behavior is unchanged.
+
 ## 1.1.5 - 2026-11-26
 
 - Made 「一键关闭」 the same size and weight as 「一键启动」: both are filled buttons, side by side at the top. Shutdown uses a red fill. Shutdown behavior is unchanged.

@@ -1087,6 +1087,52 @@ private func uniqueStrings(_ values: [String]) -> [String] {
 
 // MARK: - SwiftUI view
 
+private struct RectButtonStyle: ButtonStyle {
+    enum Role {
+        case launch
+        case shutdown
+    }
+
+    var role: Role
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(foreground)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(shape.fill(fill(pressed: configuration.isPressed)))
+            .overlay(shape.strokeBorder(border, lineWidth: role == .shutdown ? 1 : 0))
+            .opacity(isEnabled ? 1 : 0.42)
+    }
+
+    private var foreground: Color {
+        switch role {
+        case .launch:
+            return .white
+        case .shutdown:
+            return Color(red: 0.62, green: 0.22, blue: 0.20)
+        }
+    }
+
+    private func fill(pressed: Bool) -> Color {
+        switch role {
+        case .launch:
+            return pressed
+                ? Color(red: 0.08, green: 0.40, blue: 0.43)
+                : Color(red: 0.14, green: 0.46, blue: 0.49)
+        case .shutdown:
+            return Color(red: 0.62, green: 0.22, blue: 0.20).opacity(pressed ? 0.16 : 0.08)
+        }
+    }
+
+    private var border: Color {
+        Color(red: 0.62, green: 0.22, blue: 0.20).opacity(0.38)
+    }
+}
+
 private struct StepRow: View {
     let step: WorkflowStep
 
@@ -1178,47 +1224,36 @@ struct ContentView: View {
             )
 
             VStack(spacing: 0) {
-                HStack(spacing: 8) {
+                VStack(spacing: 10) {
                     Button(action: model.runAll) {
                         HStack(spacing: 6) {
-                            if model.isRunning && !model.isShuttingDown { ProgressView().controlSize(.small) }
+                            if model.isRunning && !model.isShuttingDown {
+                                ProgressView().controlSize(.small).tint(.white)
+                            }
                             Image(systemName: model.isRunning && !model.isShuttingDown ? "hourglass" : "play.fill")
                             Text(model.isRunning && !model.isShuttingDown ? "正在执行…" : "一键启动")
-                                .fontWeight(.semibold)
                                 .lineLimit(1)
                         }
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 40)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .tint(Color(red: 0.05, green: 0.55, blue: 0.58))
+                    .buttonStyle(RectButtonStyle(role: .launch))
                     .disabled(model.isRunning)
 
                     Button(action: model.shutDown) {
                         HStack(spacing: 6) {
-                            if model.isShuttingDown { ProgressView().controlSize(.small) }
+                            if model.isShuttingDown {
+                                ProgressView().controlSize(.small)
+                            }
                             Image(systemName: model.isShuttingDown ? "hourglass" : "stop.fill")
                             Text(model.isShuttingDown ? "正在关闭…" : "一键关闭")
-                                .fontWeight(.semibold)
                                 .lineLimit(1)
                         }
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 40)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    .tint(Color(red: 0.82, green: 0.18, blue: 0.18))
+                    .buttonStyle(RectButtonStyle(role: .shutdown))
                     .disabled(model.isRunning)
+                    .help("关闭 Claude 和 Tailscale，不重新打开 Clash")
                 }
-                .padding(.top, 14)
-                .padding(.bottom, 2)
-
-                Text("关闭 Claude 和 Tailscale，不重新打开 Clash")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.bottom, 6)
+                .padding(.top, 16)
+                .padding(.bottom, 18)
 
                 ForEach(model.steps) { step in
                     StepRow(step: step)

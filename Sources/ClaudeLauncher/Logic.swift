@@ -5,8 +5,8 @@ import Foundation
 // Self-tests cover the parsers so the VPN decisions can be checked without a Mac.
 
 enum LauncherVersion {
-    static let marketing = "1.1.5"
-    static let userAgent = "ClaudeLauncher/1.1.5"
+    static let marketing = "1.1.6"
+    static let userAgent = "ClaudeLauncher/1.1.6"
 }
 
 // MARK: - Trace and supported regions
